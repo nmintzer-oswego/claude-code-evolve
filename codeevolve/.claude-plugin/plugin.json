@@ -1,0 +1,9 @@
+{
+  "name": "codeevolve",
+  "description": "Evolutionary code optimization for Python functions. Uses OpenEvolve + Claude Code API to evolve your function to a faster implementation while preserving correctness.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Noah"
+  },
+  "license": "MIT"
+}

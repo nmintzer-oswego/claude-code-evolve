@@ -1,0 +1,40 @@
+# Configure
+
+Configure CodeEvolve default settings. Writes to `.codeevolve/config.yaml` at the project root.
+
+```bash
+python -c "
+from pathlib import Path
+p = Path('.codeevolve/config.yaml')
+if p.exists():
+    print('Current settings:')
+    print(p.read_text())
+else:
+    print('No config file yet.')
+"
+```
+
+Show the current settings (or note that none exist yet). Then ask the user three questions:
+
+1. **Default optimization objective** — `time` (wall-clock speedup), `space` (memory reduction), or `balanced` (70% time + 30% space). Default: `time`.
+
+2. **Default iteration count** — How many evolution iterations per run? Default: `20`. R6 finding: most problems reach optimal within 10 iterations; 20 gives headroom. Range: 10–100.
+
+3. **Minimum speedup threshold** — Results below this are reported as "no significant improvement". Default: `1.1`. R5 finding: measurement noise floor is 1.03x; 1.1x is safely above it.
+
+After the user answers, write `.codeevolve/config.yaml`:
+
+```bash
+python -c "
+from pathlib import Path
+Path('.codeevolve').mkdir(exist_ok=True)
+Path('.codeevolve/config.yaml').write_text('''# CodeEvolve project configuration
+default_objective: OBJECTIVE
+default_iterations: ITERATIONS
+min_speedup_threshold: THRESHOLD
+''')
+print('Saved.')
+"
+```
+
+Confirm: "Settings saved to `.codeevolve/config.yaml`. These will be used as defaults for future `/optimize` runs."

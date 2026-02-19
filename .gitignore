@@ -1,0 +1,19 @@
+# CodeEvolve runtime artifacts — machine-specific, not for repo
+.codeevolve/runs/
+lib/openevolve_pkg/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
