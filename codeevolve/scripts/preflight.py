@@ -125,10 +125,29 @@ def load_function(filepath: str, func_name: str):
     return getattr(mod, func_name)
 
 
+def _try_extract_call(node, func_name: str):
+    """Extract literal args from a Call node if it matches func_name. Returns tuple or None."""
+    if not isinstance(node, ast.Call):
+        return None
+    call_name = ''
+    if isinstance(node.func, ast.Name):
+        call_name = node.func.id
+    elif isinstance(node.func, ast.Attribute):
+        call_name = node.func.attr
+    if call_name != func_name:
+        return None
+    try:
+        return tuple(ast.literal_eval(a) for a in node.args)
+    except (ValueError, TypeError):
+        return None
+
+
 def extract_test_inputs(test_file: str, func_name: str) -> list:
     """
-    Extract input args from test file using AST.
-    Looks for: assert func(args) == expected  or  result = func(args)
+    Extract input args from test file using AST. Handles multiple patterns:
+      - assert func(args) == expected
+      - assert func(args)[key] == expected   (subscript)
+      - result = func(args)
     Returns list of arg tuples as literal values.
     """
     with open(test_file, 'r', encoding='utf-8') as f:
@@ -139,24 +158,27 @@ def extract_test_inputs(test_file: str, func_name: str) -> list:
         return []
 
     inputs = []
+
+    def _add(args):
+        if args is not None and args not in inputs:
+            inputs.append(args)
+
     for node in ast.walk(tree):
-        # Pattern: assert func(args) == expected
+        # Pattern 1: assert func(args) == expected
         if isinstance(node, ast.Assert):
             test = node.test
             if isinstance(test, ast.Compare) and len(test.ops) == 1:
                 left = test.left
-                if isinstance(left, ast.Call):
-                    call_name = ''
-                    if isinstance(left.func, ast.Name):
-                        call_name = left.func.id
-                    elif isinstance(left.func, ast.Attribute):
-                        call_name = left.func.attr
-                    if call_name == func_name:
-                        try:
-                            args = tuple(ast.literal_eval(a) for a in left.args)
-                            inputs.append(args)
-                        except (ValueError, TypeError):
-                            pass
+                # Direct call: assert func(args) == x
+                _add(_try_extract_call(left, func_name))
+                # Subscript: assert func(args)[key] == x
+                if isinstance(left, ast.Subscript):
+                    _add(_try_extract_call(left.value, func_name))
+
+        # Pattern 2: result = func(args)
+        elif isinstance(node, ast.Assign):
+            _add(_try_extract_call(node.value, func_name))
+
     return inputs
 
 

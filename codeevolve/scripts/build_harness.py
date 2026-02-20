@@ -94,119 +94,6 @@ def write_initial_py(run_dir: Path, imports: str, func_source: str, func_name: s
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Extract test cases from test file (AST-only approach)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def extract_test_cases(test_file: str, func_name: str) -> list[tuple]:
-    """
-    Parse test file with AST looking for: assert func(args) == expected
-    Returns list of ((args...), expected) tuples using ast.literal_eval.
-    Only cases where all args and expected are literals are included.
-    """
-    with open(test_file, 'r', encoding='utf-8') as f:
-        source = f.read()
-    try:
-        tree = ast.parse(source, filename=test_file)
-    except SyntaxError:
-        return []
-
-    cases = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assert):
-            continue
-        test = node.test
-        # Pattern: assert func(args) == expected
-        if not isinstance(test, ast.Compare):
-            continue
-        if len(test.ops) != 1 or not isinstance(test.ops[0], ast.Eq):
-            continue
-
-        left = test.left
-        comparators = test.comparators
-        if not comparators:
-            continue
-
-        # Handle: assert func(args) == expected  AND  assert expected == func(args)
-        call_node = None
-        expected_node = None
-        if isinstance(left, ast.Call):
-            call_node = left
-            expected_node = comparators[0]
-        elif isinstance(comparators[0], ast.Call):
-            call_node = comparators[0]
-            expected_node = left
-
-        if call_node is None:
-            continue
-
-        # Check function name matches
-        call_name = ''
-        if isinstance(call_node.func, ast.Name):
-            call_name = call_node.func.id
-        elif isinstance(call_node.func, ast.Attribute):
-            call_name = call_node.func.attr
-
-        if call_name != func_name:
-            continue
-
-        # Try to extract literal args
-        try:
-            args = tuple(ast.literal_eval(a) for a in call_node.args)
-            # Handle keyword args that pass lists/dicts as positional
-            expected = ast.literal_eval(expected_node)
-            cases.append((args, expected))
-        except (ValueError, TypeError):
-            pass
-
-    return cases
-
-
-def infer_compare_output(cases: list[tuple]) -> str:
-    """
-    Infer a compare_output function based on the types of expected values.
-    Returns Python source for the compare_output function.
-
-    Uses exact equality by default. Only uses sort-comparison when the expected
-    values are sets (Python set literals), because lists are ordered and sorting
-    would mask wrong-order results (e.g. productExceptSelf, prefix sums, etc.).
-    """
-    if not cases:
-        return "def compare_output(result, expected):\n    return result == expected\n"
-
-    # Only sort-compare if the expected values are actual Python sets (unordered)
-    for _, expected in cases:
-        if isinstance(expected, set):
-            return (
-                "def compare_output(result, expected):\n"
-                "    \"\"\"Sort both before comparing — expected values are unordered sets.\"\"\"\n"
-                "    try:\n"
-                "        return sorted(result) == sorted(expected)\n"
-                "    except TypeError:\n"
-                "        return result == expected\n"
-            )
-    # Default: exact equality (preserves order for lists, tuples, scalars)
-    return "def compare_output(result, expected):\n    return result == expected\n"
-
-
-def format_test_cases(cases: list[tuple]) -> str:
-    """Format test cases as Python source for the evaluator."""
-    if not cases:
-        return (
-            "# TODO: Add test cases in this format:\n"
-            "# TEST_CASES = [\n"
-            "#     ((arg1, arg2, ...), expected_output),\n"
-            "#     ...\n"
-            "# ]\n"
-            "TEST_CASES = []\n"
-        )
-    lines = ["TEST_CASES = ["]
-    for args, expected in cases:
-        lines.append(f"    ({repr(args)}, {repr(expected)}),")
-    lines.append("]")
-    return '\n'.join(lines)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Derive benchmark sizes from baseline data
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -252,13 +139,36 @@ def derive_benchmark_sizes(baseline: dict, extracted_inputs: list) -> list[int]:
 def generate_benchmark_input_source(extracted_inputs: list, sizes: list[int]) -> str:
     """
     Generate source for the generate_benchmark_input(n) function.
-    Uses the first extracted input as a template if it's a list.
-    Falls back to generating a shuffled list of integers.
+
+    Detects the input shape from the first extracted input and generates a
+    matching scalable benchmark generator. Falls back to a shuffled list of
+    integers only when no extracted inputs are available.
     """
-    # Check if the first input is a single list — common case
     first_input = extracted_inputs[0] if extracted_inputs else None
+
+    # Pattern: (int, list-of-lists, int) — graph/adjacency problems
+    # e.g. shortestPath(n, edges, src)
+    if (first_input and len(first_input) == 3
+            and isinstance(first_input[0], int)
+            and isinstance(first_input[1], list)
+            and first_input[1] and isinstance(first_input[1][0], list)
+            and isinstance(first_input[2], int)):
+        return textwrap.dedent("""\
+            def generate_benchmark_input(n):
+                \"\"\"Generate deterministic (n, edges, src) graph input of scale n.\"\"\"
+                import random
+                random.seed(n)
+                edges = []
+                for i in range(n - 1):
+                    edges.append([i, i + 1, random.randint(1, 100)])
+                for i in range(0, n - 10, 5):
+                    edges.append([i, i + 10, random.randint(1, 50)])
+                    edges.append([i, i + 7, random.randint(1, 50)])
+                return (n, edges, 0)
+            """)
+
+    # Pattern: (list,) — single-list input
     if first_input and len(first_input) == 1 and isinstance(first_input[0], list):
-        # Single-list input: generate a shuffled list of size n
         return textwrap.dedent("""\
             def generate_benchmark_input(n):
                 \"\"\"Generate deterministic benchmark input of size n.\"\"\"
@@ -268,8 +178,9 @@ def generate_benchmark_input_source(extracted_inputs: list, sizes: list[int]) ->
                 random.shuffle(lst)
                 return (lst,)
             """)
-    elif first_input and len(first_input) == 2 and isinstance(first_input[0], list):
-        # Two-arg input where first is a list: pass second arg from largest test case
+
+    # Pattern: (list, scalar) — list + second arg
+    if first_input and len(first_input) == 2 and isinstance(first_input[0], list):
         second_arg = first_input[1]
         return textwrap.dedent(f"""\
             def generate_benchmark_input(n):
@@ -280,17 +191,19 @@ def generate_benchmark_input_source(extracted_inputs: list, sizes: list[int]) ->
                 random.shuffle(lst)
                 return (lst, {repr(second_arg)})
             """)
-    else:
-        # Generic fallback: generate a list of integers
-        return textwrap.dedent("""\
-            def generate_benchmark_input(n):
-                \"\"\"Generate deterministic benchmark input of size n (list of integers).\"\"\"
-                import random
-                random.seed(n)
-                lst = list(range(n))
-                random.shuffle(lst)
-                return (lst,)
-            """)
+
+    # Generic fallback: generate a list of integers.
+    # NOTE: This may not match the function's actual signature for multi-arg functions.
+    # If speedup measurement is nonsensical, manually edit generate_benchmark_input in evaluator.py.
+    return textwrap.dedent("""\
+        def generate_benchmark_input(n):
+            \"\"\"Generate deterministic benchmark input of size n (list of integers).\"\"\"
+            import random
+            random.seed(n)
+            lst = list(range(n))
+            random.shuffle(lst)
+            return (lst,)
+        """)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -304,15 +217,17 @@ Function: {func_name}
 Objective: {objective}
 
 OpenEvolve calls evaluate(program_path) → Dict[str, float].
-Two-stage gate: correctness must pass before performance is measured.
+Two-stage gate: correctness (pytest) must pass before performance is measured.
 
-Auto-generated by build_harness.py. You can edit TEST_CASES manually
-if auto-extraction missed any cases.
+Auto-generated by build_harness.py.
 """
 
 import importlib.util
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from typing import List, Tuple, Dict, Optional, Any
 
 # Add codeevolve/scripts to path for measure_performance
@@ -328,13 +243,15 @@ from measure_performance import measure_runtime
 # === Problem-specific config ===
 FUNCTION_NAME = {func_name_repr}
 
-{test_cases_source}
+# Path to the user's pytest test file (absolute, set at harness-build time)
+TEST_FILE = {test_file_repr}
+
+# Name of the module the test file imports from (stem of the original function file)
+MODULE_NAME = {module_name_repr}
 
 # Benchmark sizes (chosen to be in >1ms regime for reliable measurement)
 BENCHMARK_SIZES = {benchmark_sizes}
 
-
-{compare_output_source}
 
 {generate_benchmark_input_source}
 
@@ -359,38 +276,36 @@ def _load_module(filepath):
 
 def evaluate(program_path):
     """Evaluate an evolved implementation of {func_name}."""
+    # === STAGE 1: CORRECTNESS — run pytest against evolved program ===
     try:
-        mod = _load_module(program_path)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Make the evolved program importable under the original module name
+            shutil.copy(program_path, os.path.join(tmpdir, MODULE_NAME + \'.py\'))
+            result = subprocess.run(
+                [sys.executable, \'-m\', \'pytest\', TEST_FILE,
+                 \'--tb=no\', \'-q\', \'--no-header\'],
+                cwd=tmpdir,
+                capture_output=True,
+                timeout=60,
+            )
+            correctness = 1.0 if result.returncode == 0 else 0.0
     except Exception:
         return {{"combined_score": 0.0, "correctness": 0.0, "avg_speedup": 0.0}}
 
+    if correctness < 1.0:
+        return {{"combined_score": 0.0, "correctness": correctness, "avg_speedup": 0.0}}
+
+    # === STAGE 2: PERFORMANCE (R5 protocol) ===
+    try:
+        mod = _load_module(program_path)
+    except Exception:
+        return {{"combined_score": 0.0, "correctness": correctness, "avg_speedup": 0.0}}
+
     if not hasattr(mod, FUNCTION_NAME):
-        return {{"combined_score": 0.0, "correctness": 0.0, "avg_speedup": 0.0}}
+        return {{"combined_score": 0.0, "correctness": correctness, "avg_speedup": 0.0}}
 
     func = getattr(mod, FUNCTION_NAME)
 
-    # === STAGE 1: CORRECTNESS ===
-    if not TEST_CASES:
-        # No test cases extracted — skip correctness gate, score on performance only
-        correctness = 1.0
-    else:
-        passed = 0
-        for args, expected in TEST_CASES:
-            try:
-                result = func(*args)
-                if compare_output(result, expected):
-                    passed += 1
-            except Exception:
-                return {{
-                    "combined_score": 0.0,
-                    "correctness": float(passed) / len(TEST_CASES),
-                    "avg_speedup": 0.0,
-                }}
-        correctness = float(passed) / len(TEST_CASES)
-        if passed < len(TEST_CASES):
-            return {{"combined_score": 0.0, "correctness": correctness, "avg_speedup": 0.0}}
-
-    # === STAGE 2: PERFORMANCE (R5 protocol) ===
     speedups = []
     for n in BENCHMARK_SIZES:
         args = generate_benchmark_input(n)
@@ -411,12 +326,10 @@ def evaluate(program_path):
 
 def write_evaluator_py(run_dir: Path, func_name: str, objective: str,
                        imports: str, func_source: str,
-                       cases: list[tuple], baseline: dict,
-                       extracted_inputs: list) -> None:
+                       test_file: str, module_name: str,
+                       baseline: dict, extracted_inputs: list) -> None:
     """Generate and write evaluator.py to the run directory."""
     benchmark_sizes = derive_benchmark_sizes(baseline, extracted_inputs)
-    compare_output_src = infer_compare_output(cases)
-    test_cases_src = format_test_cases(cases)
     gen_input_src = generate_benchmark_input_source(extracted_inputs, benchmark_sizes)
 
     # inline_brute = the original function, renamed to inline_brute
@@ -429,9 +342,9 @@ def write_evaluator_py(run_dir: Path, func_name: str, objective: str,
         func_name=func_name,
         func_name_repr=repr(func_name),
         objective=objective,
-        test_cases_source=test_cases_src,
+        test_file_repr=repr(test_file),
+        module_name_repr=repr(module_name),
         benchmark_sizes=repr(benchmark_sizes),
-        compare_output_source=compare_output_src,
         generate_benchmark_input_source=gen_input_src,
         inline_brute_source=inline_brute_src,
     )
@@ -514,6 +427,10 @@ def main():
     baseline = preflight_data.get('baseline', {})
     extracted_inputs = preflight_data.get('extracted_inputs', [])
 
+    # The module name the test file imports from is the stem of the function file.
+    # e.g. solution.py → 'solution', so the evaluator copies evolved.py as solution.py
+    module_name = Path(function_file).stem
+
     # Create run directory
     run_dir = PROJECT_ROOT / '.codeevolve' / 'runs' / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -529,19 +446,16 @@ def main():
     print("  Writing initial.py...")
     write_initial_py(run_dir, imports, func_source, func_name)
 
-    # Extract test cases
-    print("  Extracting test cases via AST...")
-    cases = extract_test_cases(test_file, func_name)
-    if cases:
-        print(f"  Extracted {len(cases)} test case(s)")
-    else:
-        print("  WARNING: No test cases extracted via AST.")
-        print("  The generated evaluator.py has a TODO marker — fill in TEST_CASES manually.")
+    # Detect benchmark input shape
+    benchmark_sizes = derive_benchmark_sizes(baseline, extracted_inputs)
+    gen_src = generate_benchmark_input_source(extracted_inputs, benchmark_sizes)
+    input_shape = "graph (n, edges, src)" if "edges" in gen_src else \
+                  "list" if "(lst,)" in gen_src else "unknown"
 
     # Write evaluator.py
     print("  Writing evaluator.py...")
     write_evaluator_py(run_dir, func_name, args.objective, imports, func_source,
-                       cases, baseline, extracted_inputs)
+                       test_file, module_name, baseline, extracted_inputs)
 
     # Write config.yaml
     print("  Writing config.yaml...")
@@ -553,7 +467,7 @@ def main():
 
     print(f"\nHarness built: {run_dir}")
     print(f"  initial.py    — {func_name} with EVOLVE-BLOCK markers")
-    print(f"  evaluator.py  — {len(cases)} test cases, {derive_benchmark_sizes(baseline, extracted_inputs)} benchmark sizes")
+    print(f"  evaluator.py  — pytest correctness gate, {input_shape} benchmark ({benchmark_sizes})")
     print(f"  config.yaml   — {args.iterations} iterations, objective={args.objective}")
 
     # Output run dir path for the calling slash command
